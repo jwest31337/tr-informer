@@ -1,28 +1,24 @@
 import os
-import asyncio
 import json
+import time
 from datetime import datetime
 from pathlib import Path
+import asyncio
 
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, Form, HTTPException, Depends
-from pydantic import BaseModel
 import ollama
 import chromadb
 from sentence_transformers import SentenceTransformer
-import uvicorn
 from faster_whisper import WhisperModel
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 # ────────────────────────────────────────────────
 # Load environment variables
 # ────────────────────────────────────────────────
 load_dotenv()
-
-API_KEY = os.getenv("API_KEY")
-if not API_KEY:
-    raise ValueError("API_KEY not set in .env")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
@@ -34,23 +30,29 @@ if DISCORD_CHANNEL_ID == 0:
 
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
 
-# ────────────────────────────────────────────────
-# Configs & Initialization
-# ────────────────────────────────────────────────
-app = FastAPI(title="tr-informer")
+WATCH_DIR = os.getenv("WATCH_DIR")
+if not WATCH_DIR:
+    raise ValueError("WATCH_DIR not set in .env")
+WATCH_DIR = str(Path(WATCH_DIR).resolve())  # Normalize path
 
-# Faster-Whisper (CPU-optimized)
-print("Loading faster-whisper model (medium.en int8 CPU)...")
+print(f"Starting tr-informer")
+print(f" - Watching directory: {WATCH_DIR}")
+print(f" - Ollama model: {OLLAMA_MODEL}")
+print(f" - Discord channel ID: {DISCORD_CHANNEL_ID}")
+
+# ────────────────────────────────────────────────
+# Initialize components
+# ────────────────────────────────────────────────
 whisper_model = WhisperModel(
     "medium.en",
     device="cpu",
     compute_type="int8",
-    cpu_threads=4,
-    # download_root="~/.cache/whisper"
+    cpu_threads=4
 )
 print("Whisper model loaded.")
 
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+print("Embedding model loaded.")
 
 chroma_client = chromadb.PersistentClient(path="./tr_informer_db")
 collection = chroma_client.get_or_create_collection(name="radio_history")
@@ -66,46 +68,56 @@ async def on_ready():
 
 @bot.command(name="query")
 async def query_history(ctx, *, question: str):
-    # Semantic search in history
-    results = collection.query(
-        query_texts=[question],
-        n_results=8
-    )
-    history_snippets = [meta.get('interpretation', meta.get('transcript', '')) 
-                        for meta in results['metadatas'][0] if meta]
-    history_context = "\n\n".join(history_snippets)[:4000]  # avoid token blowup
+    results = collection.query(query_texts=[question], n_results=8)
+    history_snippets = [
+        meta.get('interpretation', meta.get('transcript', ''))
+        for meta in results['metadatas'][0] if meta
+    ]
+    history_context = "\n\n".join(history_snippets)[:4000]
 
     response = ollama.chat(model=OLLAMA_MODEL, messages=[
-        {"role": "system", "content": "You are a helpful radio dispatch analyst. Use provided history to answer questions concisely and factually."},
+        {"role": "system", "content": "You are a radio dispatch analyst. Use history to answer concisely."},
         {"role": "user", "content": f"History:\n{history_context}\n\nQuestion: {question}"}
     ])
-    await ctx.send(response['message']['content'][:2000])  # Discord message limit
-
-# API key check
-def check_api_key(x_api_key: str = Form(...)):
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return x_api_key
+    await ctx.send(response['message']['content'][:2000])
 
 # ────────────────────────────────────────────────
-# Upload endpoint (called by trunk-recorder)
+# File watcher & processing
 # ────────────────────────────────────────────────
-@app.post("/upload")
-async def handle_upload(
-    call_json: str = Form(...),
-    audio: UploadFile = UploadFile(...),
-    api_key: str = Depends(check_api_key)
-):
-    # Save audio temporarily
-    audio_path = f"/tmp/{audio.filename}"
-    try:
-        with open(audio_path, "wb") as f:
-            f.write(await audio.read())
+class CallHandler(FileSystemEventHandler):
+    def on_created(self, event):
+        if event.is_directory:
+            return
+
+        path = Path(event.src_path)
+        if path.suffix.lower() not in ['.wav', '.mp3']:
+            return
+
+        # Give JSON a moment to appear (sometimes written after audio)
+        time.sleep(2)
+
+        json_path = path.with_suffix('.json')
+        if not json_path.exists():
+            print(f"No JSON found for {path}")
+            return
+
+        print(f"New call detected: {path} + {json_path}")
+
+        try:
+            with open(json_path, 'r') as f:
+                metadata = json.load(f)
+        except Exception as e:
+            print(f"Error reading JSON {json_path}: {e}")
+            return
+
+        timestamp = datetime.fromtimestamp(metadata.get('start_time', 0)).isoformat()
+        talkgroup = metadata.get('talkgroup_tag', metadata.get('talkgroup', 'Unknown'))
+        call_id = metadata.get('call_id', 'unknown')
 
         # Transcribe
         try:
             segments, info = whisper_model.transcribe(
-                audio_path,
+                str(path),
                 beam_size=5,
                 language="en",
                 vad_filter=True,
@@ -119,32 +131,19 @@ async def handle_upload(
             transcript = f"[Transcription failed: {str(e)}]"
             print(f"Transcription error: {e}")
 
-        # Parse metadata
-        try:
-            metadata = json.loads(call_json)
-        except:
-            metadata = {}
-        
-        timestamp = datetime.fromtimestamp(metadata.get('start_time', 0)).isoformat()
-        talkgroup = metadata.get('talkgroup_tag', metadata.get('talkgroup', 'Unknown'))
-        call_id = metadata.get('call_id', 'unknown')
-
         # Interpret with Ollama
         interp_response = ollama.chat(model=OLLAMA_MODEL, messages=[
             {
                 "role": "system",
-                "content": "You are an expert at interpreting police/fire/EMS radio traffic. Summarize clearly, expand 10-codes, identify locations/incidents, note urgency."
+                "content": "Interpret police/fire/EMS radio transcript: summarize clearly, expand 10-codes, identify locations/incidents, note urgency."
             },
-            {"role": "user", "content": f"Raw transcript: {transcript}"}
+            {"role": "user", "content": transcript}
         ])
         interpretation = interp_response['message']['content']
 
-        # Retrieve recent/similar history for context
+        # Retrieve recent/similar history
         query_embedding = embedding_model.encode(transcript + " " + interpretation).tolist()
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=6
-        )
+        results = collection.query(query_embeddings=[query_embedding], n_results=6)
         history_context = "\n".join(
             f"{meta.get('timestamp', '?')}: {meta.get('interpretation', meta.get('transcript', ''))}"
             for meta in results['metadatas'][0] if meta
@@ -154,7 +153,7 @@ async def handle_upload(
         insights_response = ollama.chat(model=OLLAMA_MODEL, messages=[
             {
                 "role": "system",
-                "content": "Analyze new radio event against recent history. Identify patterns, ongoing incidents, or connections in the observed area."
+                "content": "Analyze new radio event against recent history. Identify patterns, ongoing incidents in the area."
             },
             {
                 "role": "user",
@@ -186,31 +185,30 @@ async def handle_upload(
                 f"**Interpretation:** {interpretation[:400]}{'...' if len(interpretation) > 400 else ''}\n"
                 f"**Insights:** {insights[:500]}{'...' if len(insights) > 500 else ''}"
             )
-            await channel.send(msg[:2000])  # safety cut
-
-        return {"status": "processed", "transcript": transcript[:500]}
-
-    finally:
-        if os.path.exists(audio_path):
-            try:
-                os.remove(audio_path)
-            except:
-                pass
+            asyncio.create_task(channel.send(msg[:2000]))
 
 # ────────────────────────────────────────────────
-# Run both FastAPI and Discord bot
+# Run bot + watcher
 # ────────────────────────────────────────────────
-async def run_bot():
-    await bot.start(DISCORD_TOKEN)
+async def run_watcher():
+    event_handler = CallHandler()
+    observer = Observer()
+    observer.schedule(event_handler, WATCH_DIR, recursive=True)
+    observer.start()
+    print(f"Started recursive file watcher on {WATCH_DIR}")
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
 
 async def main():
     # Start Discord bot in background
-    asyncio.create_task(run_bot())
+    asyncio.create_task(bot.start(DISCORD_TOKEN))
     
-    # Run Uvicorn (it will create/manage its own loop)
-    config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
-    server = uvicorn.Server(config)
-    await server.serve()
+    # Start file watcher
+    await run_watcher()
 
 if __name__ == "__main__":
     asyncio.run(main())
