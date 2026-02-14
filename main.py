@@ -203,12 +203,14 @@ async def handle_upload(
 async def run_bot():
     await bot.start(DISCORD_TOKEN)
 
+async def main():
+    # Start Discord bot in background
+    asyncio.create_task(run_bot())
+    
+    # Run Uvicorn (it will create/manage its own loop)
+    config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.create_task(run_bot())
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000,
-        loop=loop
-    )
+    asyncio.run(main())
