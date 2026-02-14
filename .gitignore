@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+tr_informer_db/
+*.log
+/tmp/*
