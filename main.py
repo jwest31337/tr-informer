@@ -4,6 +4,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 import asyncio
+import subprocess
 
 import discord
 from discord.ext import commands
@@ -12,6 +13,7 @@ import ollama
 import chromadb
 from sentence_transformers import SentenceTransformer
 from faster_whisper import WhisperModel
+from collections import deque
 
 # ────────────────────────────────────────────────
 # Load environment variables
@@ -33,10 +35,13 @@ if not WATCH_DIR:
     raise ValueError("WATCH_DIR not set in .env")
 WATCH_DIR = str(Path(WATCH_DIR).resolve())
 
+BATCH_INTERVAL = int(os.getenv("BATCH_INTERVAL", "900"))  # 15 minutes default
+
 print(f"Starting tr-informer - Direct NFS polling mode")
 print(f" - Watching directory: {WATCH_DIR}")
 print(f" - Ollama model: {OLLAMA_MODEL}")
 print(f" - Discord channel ID: {DISCORD_CHANNEL_ID}")
+print(f" - Batch summary every {BATCH_INTERVAL} seconds")
 
 # ────────────────────────────────────────────────
 # Initialize components
@@ -64,11 +69,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     print(f"*** DISCORD BOT LOGGED IN AS {bot.user} ***")
     print(f" - Connected to {len(bot.guilds)} servers")
-    try:
-        channel = bot.get_channel(DISCORD_CHANNEL_ID)
-        print(f" - Target channel: {channel.name if channel else 'NOT FOUND'} (ID: {DISCORD_CHANNEL_ID})")
-    except Exception as e:
-        print(f" - Channel lookup failed: {e}")
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+    print(f" - Target channel: {channel.name if channel else 'NOT FOUND'} (ID: {DISCORD_CHANNEL_ID})")
 
 @bot.command(name="query")
 async def query_history(ctx, *, question: str):
@@ -84,6 +86,52 @@ async def query_history(ctx, *, question: str):
         {"role": "user", "content": f"History:\n{history_context}\n\nQuestion: {question}"}
     ])
     await ctx.send(response['message']['content'][:2000])
+
+# ────────────────────────────────────────────────
+# Batch buffer & summary
+# ────────────────────────────────────────────────
+call_buffer = deque(maxlen=100)  # Keep last 100 calls for batching
+last_batch_time = time.time()
+
+async def batch_summarize_and_post():
+    global last_batch_time
+    if time.time() - last_batch_time < BATCH_INTERVAL or len(call_buffer) == 0:
+        return
+
+    print(f"Creating batch summary for {len(call_buffer)} calls")
+
+    batch_text = ""
+    for call in call_buffer:
+        batch_text += f"{call['timestamp']} {call['talkgroup']}: {call['transcript'][:200]}...\n"
+
+    try:
+        summary_response = ollama.chat(model=OLLAMA_MODEL, messages=[
+            {
+                "role": "system",
+                "content": "You are a radio dispatch monitor. Summarize recent calls concisely: key events, locations, units, ongoing incidents. Use timeline format if multiple calls."
+            },
+            {"role": "user", "content": f"Recent calls:\n{batch_text}\n\nSummarize what happened in this period."}
+        ])
+        batch_summary = summary_response['message']['content']
+    except Exception as e:
+        batch_summary = f"[Batch summary failed: {str(e)}]"
+        print(f"Batch Ollama error: {e}")
+
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+    if channel:
+        msg = (
+            f"**Batch Update – {len(call_buffer)} calls**\n"
+            f"Time window: {call_buffer[0]['timestamp']} to {call_buffer[-1]['timestamp']}\n\n"
+            f"{batch_summary}"
+        )
+        try:
+            await channel.send(msg[:2000])
+            print("Batch summary posted to Discord")
+        except Exception as e:
+            print(f"Failed to post batch summary: {e}")
+
+    call_buffer.clear()
+    last_batch_time = time.time()
 
 # ────────────────────────────────────────────────
 # Process a single call
@@ -107,17 +155,36 @@ async def process_call(audio_path: Path):
 
     print(f"Processing call {call_id} ({talkgroup}, {timestamp})")
 
+    # Convert m4a to 16kHz WAV if needed
+    audio_file = str(audio_path)
+    if audio_path.suffix.lower() in ['.m4a', '.mp4']:
+        wav_path = audio_path.with_suffix('.wav')
+        cmd = [
+            "ffmpeg", "-y", "-i", str(audio_path),
+            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+            str(wav_path)
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            audio_file = str(wav_path)
+            print(f"Converted to WAV: {wav_path}")
+        except Exception as e:
+            print(f"ffmpeg conversion failed: {e}")
+            audio_file = str(audio_path)  # fallback
+
     # Transcribe
     try:
         segments, info = whisper_model.transcribe(
-            str(audio_path),
-            beam_size=5,
+            audio_file,
+            beam_size=7,
             language="en",
             vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
             initial_prompt=(
-                "police radio dispatch fire ems ambulance 10-4 10- codes "
-                "affirmative negative"
-            )
+                "Police fire EMS dispatch radio traffic, 10-codes, unit numbers, locations in New Mexico, "
+                "affirmative negative enroute on scene 10-4 10-50 10-20 clear copy responding priority"
+            ),
+            condition_on_previous_text=True
         )
         transcript = " ".join(seg.text.strip() for seg in segments if seg.text.strip())
         print(f"Transcript (first 100 chars): {transcript[:100]}...")
@@ -140,12 +207,12 @@ async def process_call(audio_path: Path):
         interpretation = f"[Ollama interpretation failed: {str(e)}]"
         print(f"Ollama interpret error: {e}")
 
-    # Retrieve history & generate insights
+    # History & insights
     try:
         query_embedding = embedding_model.encode(transcript + " " + interpretation).tolist()
         results = collection.query(query_embeddings=[query_embedding], n_results=6)
         history_context = "\n".join(
-            f"{meta.get('timestamp', '?')}: {meta.get('interpretation', meta.get('transcript', ''))}"
+            f"{meta.get('timestamp', '?')}: {meta.get('interpretation', '')}"
             for meta in results['metadatas'][0] if meta
         )
 
@@ -179,54 +246,17 @@ async def process_call(audio_path: Path):
         }]
     )
 
-    # Post to Discord
-    channel = bot.get_channel(DISCORD_CHANNEL_ID)
-    if channel:
-        msg = (
-            f"**New Call: {talkgroup} – {timestamp}**\n"
-            f"**Transcript:** {transcript[:300]}{'...' if len(transcript) > 300 else ''}\n"
-            f"**Interpretation:** {interpretation[:400]}{'...' if len(interpretation) > 400 else ''}\n"
-            f"**Insights:** {insights[:500]}{'...' if len(insights) > 500 else ''}"
-        )
-        try:
-            await channel.send(msg[:2000])
-            print(f"Successfully posted to Discord channel {DISCORD_CHANNEL_ID}")
-        except Exception as e:
-            print(f"Failed to send Discord message: {e}")
-    else:
-        print(f"Channel {DISCORD_CHANNEL_ID} not found or bot not in server")
+    # Add to batch buffer
+    call_buffer.append({
+        "timestamp": timestamp,
+        "talkgroup": talkgroup,
+        "transcript": transcript,
+        "interpretation": interpretation,
+        "insights": insights
+    })
 
-# ────────────────────────────────────────────────
-# Polling watcher loop
-# ────────────────────────────────────────────────
-async def run_watcher():
-    print(f"Starting polling watcher on {WATCH_DIR} (every 15 seconds)")
-    known_paths = set()
-
-    while True:
-        try:
-            for root, dirs, files in os.walk(WATCH_DIR):
-                for filename in files:
-                    if filename.lower().endswith(('.wav', '.mp3', '.m4a')):  # added .m4a from your ls
-                        audio_path = Path(root) / filename
-                        str_path = str(audio_path)
-
-                        if str_path in known_paths:
-                            continue
-
-                        known_paths.add(str_path)
-
-                        json_path = audio_path.with_suffix('.json')
-
-                        if json_path.exists():
-                            print(f"Poll detected new call: {audio_path} + {json_path}")
-                            await process_call(audio_path)
-                        else:
-                            print(f"Poll found audio but no JSON yet: {audio_path}")
-        except Exception as e:
-            print(f"Polling loop error: {e}")
-
-        await asyncio.sleep(15)
+    # Try batch summary
+    await batch_summarize_and_post()
 
 # ────────────────────────────────────────────────
 # Main entry
@@ -235,7 +265,6 @@ async def main():
     print("Attempting Discord login...")
     bot_task = asyncio.create_task(bot.start(DISCORD_TOKEN))
 
-    # Wait up to 60 seconds for login
     try:
         await asyncio.wait_for(bot_task, timeout=60)
         print("Bot login task completed")
