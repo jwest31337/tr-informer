@@ -12,8 +12,6 @@ import ollama
 import chromadb
 from sentence_transformers import SentenceTransformer
 from faster_whisper import WhisperModel
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
 
 # ────────────────────────────────────────────────
 # Load environment variables
@@ -35,7 +33,7 @@ if not WATCH_DIR:
     raise ValueError("WATCH_DIR not set in .env")
 WATCH_DIR = str(Path(WATCH_DIR).resolve())  # Normalize path
 
-print(f"Starting tr-informer")
+print(f"Starting tr-informer - Direct NFS polling mode")
 print(f" - Watching directory: {WATCH_DIR}")
 print(f" - Ollama model: {OLLAMA_MODEL}")
 print(f" - Discord channel ID: {DISCORD_CHANNEL_ID}")
@@ -82,132 +80,141 @@ async def query_history(ctx, *, question: str):
     await ctx.send(response['message']['content'][:2000])
 
 # ────────────────────────────────────────────────
-# File watcher & processing
+# Polling-based watcher & processing
 # ────────────────────────────────────────────────
-class CallHandler(FileSystemEventHandler):
-    def on_created(self, event):
-        if event.is_directory:
-            return
+async def process_call(audio_path: Path):
+    """Process a single call (transcribe, interpret, store, post to Discord)"""
+    json_path = audio_path.with_suffix('.json')
+    if not json_path.exists():
+        print(f"No JSON for {audio_path}")
+        return
 
-        path = Path(event.src_path)
-        if path.suffix.lower() not in ['.wav', '.mp3']:
-            return
+    try:
+        with open(json_path, 'r') as f:
+            metadata = json.load(f)
+    except Exception as e:
+        print(f"Error reading JSON {json_path}: {e}")
+        return
 
-        # Give JSON a moment to appear (sometimes written after audio)
-        time.sleep(2)
+    timestamp = datetime.fromtimestamp(metadata.get('start_time', 0)).isoformat()
+    talkgroup = metadata.get('talkgroup_tag', metadata.get('talkgroup', 'Unknown'))
+    call_id = metadata.get('call_id', 'unknown')
 
-        json_path = path.with_suffix('.json')
-        if not json_path.exists():
-            print(f"No JSON found for {path}")
-            return
-
-        print(f"New call detected: {path} + {json_path}")
-
-        try:
-            with open(json_path, 'r') as f:
-                metadata = json.load(f)
-        except Exception as e:
-            print(f"Error reading JSON {json_path}: {e}")
-            return
-
-        timestamp = datetime.fromtimestamp(metadata.get('start_time', 0)).isoformat()
-        talkgroup = metadata.get('talkgroup_tag', metadata.get('talkgroup', 'Unknown'))
-        call_id = metadata.get('call_id', 'unknown')
-
-        # Transcribe
-        try:
-            segments, info = whisper_model.transcribe(
-                str(path),
-                beam_size=5,
-                language="en",
-                vad_filter=True,
-                initial_prompt=(
-                    "police radio dispatch fire ems ambulance 10-4 10- codes "
-                    "affirmative negative"
-                )
+    # Transcribe
+    try:
+        segments, info = whisper_model.transcribe(
+            str(audio_path),
+            beam_size=5,
+            language="en",
+            vad_filter=True,
+            initial_prompt=(
+                "police radio dispatch fire ems ambulance 10-4 10- codes "
+                "affirmative negative"
             )
-            transcript = " ".join(seg.text.strip() for seg in segments if seg.text.strip())
-        except Exception as e:
-            transcript = f"[Transcription failed: {str(e)}]"
-            print(f"Transcription error: {e}")
-
-        # Interpret with Ollama
-        interp_response = ollama.chat(model=OLLAMA_MODEL, messages=[
-            {
-                "role": "system",
-                "content": "Interpret police/fire/EMS radio transcript: summarize clearly, expand 10-codes, identify locations/incidents, note urgency."
-            },
-            {"role": "user", "content": transcript}
-        ])
-        interpretation = interp_response['message']['content']
-
-        # Retrieve recent/similar history
-        query_embedding = embedding_model.encode(transcript + " " + interpretation).tolist()
-        results = collection.query(query_embeddings=[query_embedding], n_results=6)
-        history_context = "\n".join(
-            f"{meta.get('timestamp', '?')}: {meta.get('interpretation', meta.get('transcript', ''))}"
-            for meta in results['metadatas'][0] if meta
         )
+        transcript = " ".join(seg.text.strip() for seg in segments if seg.text.strip())
+    except Exception as e:
+        transcript = f"[Transcription failed: {str(e)}]"
+        print(f"Transcription error: {e}")
 
-        # Generate insights
-        insights_response = ollama.chat(model=OLLAMA_MODEL, messages=[
-            {
-                "role": "system",
-                "content": "Analyze new radio event against recent history. Identify patterns, ongoing incidents in the area."
-            },
-            {
-                "role": "user",
-                "content": f"History:\n{history_context}\n\nNew event ({talkgroup}, {timestamp}):\n{interpretation}"
-            }
-        ])
-        insights = insights_response['message']['content']
+    # Interpret with Ollama
+    interp_response = ollama.chat(model=OLLAMA_MODEL, messages=[
+        {
+            "role": "system",
+            "content": "Interpret police/fire/EMS radio transcript: summarize clearly, expand 10-codes, identify locations/incidents, note urgency."
+        },
+        {"role": "user", "content": transcript}
+    ])
+    interpretation = interp_response['message']['content']
 
-        # Store in ChromaDB
-        doc_id = f"call_{call_id}_{timestamp.replace(':', '-')}"
-        collection.add(
-            ids=[doc_id],
-            embeddings=[query_embedding],
-            metadatas=[{
-                "timestamp": timestamp,
-                "talkgroup": talkgroup,
-                "transcript": transcript,
-                "interpretation": interpretation,
-                "insights": insights
-            }]
+    # Retrieve recent/similar history
+    query_embedding = embedding_model.encode(transcript + " " + interpretation).tolist()
+    results = collection.query(query_embeddings=[query_embedding], n_results=6)
+    history_context = "\n".join(
+        f"{meta.get('timestamp', '?')}: {meta.get('interpretation', meta.get('transcript', ''))}"
+        for meta in results['metadatas'][0] if meta
+    )
+
+    # Generate insights
+    insights_response = ollama.chat(model=OLLAMA_MODEL, messages=[
+        {
+            "role": "system",
+            "content": "Analyze new radio event against recent history. Identify patterns, ongoing incidents, or connections in the observed area."
+        },
+        {
+            "role": "user",
+            "content": f"History:\n{history_context}\n\nNew event ({talkgroup}, {timestamp}):\n{interpretation}"
+        }
+    ])
+    insights = insights_response['message']['content']
+
+    # Store in ChromaDB
+    doc_id = f"call_{call_id}_{timestamp.replace(':', '-')}"
+    collection.add(
+        ids=[doc_id],
+        embeddings=[query_embedding],
+        metadatas=[{
+            "timestamp": timestamp,
+            "talkgroup": talkgroup,
+            "transcript": transcript,
+            "interpretation": interpretation,
+            "insights": insights
+        }]
+    )
+
+    # Post to Discord
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+    if channel:
+        msg = (
+            f"**New Call: {talkgroup} – {timestamp}**\n"
+            f"**Transcript:** {transcript[:300]}{'...' if len(transcript) > 300 else ''}\n"
+            f"**Interpretation:** {interpretation[:400]}{'...' if len(interpretation) > 400 else ''}\n"
+            f"**Insights:** {insights[:500]}{'...' if len(insights) > 500 else ''}"
         )
+        await channel.send(msg[:2000])
 
-        # Post to Discord
-        channel = bot.get_channel(DISCORD_CHANNEL_ID)
-        if channel:
-            msg = (
-                f"**New Call: {talkgroup} – {timestamp}**\n"
-                f"**Transcript:** {transcript[:300]}{'...' if len(transcript) > 300 else ''}\n"
-                f"**Interpretation:** {interpretation[:400]}{'...' if len(interpretation) > 400 else ''}\n"
-                f"**Insights:** {insights[:500]}{'...' if len(insights) > 500 else ''}"
-            )
-            asyncio.create_task(channel.send(msg[:2000]))
+    print(f"Processed call {call_id} ({talkgroup}, {timestamp})")
 
 # ────────────────────────────────────────────────
-# Run bot + watcher
+# Polling watcher loop
 # ────────────────────────────────────────────────
 async def run_watcher():
-    event_handler = CallHandler()
-    observer = Observer()
-    observer.schedule(event_handler, WATCH_DIR, recursive=True)
-    observer.start()
-    print(f"Started recursive file watcher on {WATCH_DIR}")
-    try:
-        while True:
-            await asyncio.sleep(1)
-    except KeyboardInterrupt:
-        observer.stop()
-    observer.join()
+    print(f"Starting polling watcher on {WATCH_DIR} (every 15 seconds)")
+    known_paths = set()  # Prevent re-processing same files
 
+    while True:
+        try:
+            for root, dirs, files in os.walk(WATCH_DIR):
+                for filename in files:
+                    if filename.lower().endswith(('.wav', '.mp3')):
+                        audio_path = Path(root) / filename
+                        str_path = str(audio_path)
+
+                        if str_path in known_paths:
+                            continue
+
+                        known_paths.add(str_path)
+
+                        json_path = audio_path.with_suffix('.json')
+
+                        if json_path.exists():
+                            print(f"Poll detected new call: {audio_path} + {json_path}")
+                            await process_call(audio_path)
+                        else:
+                            print(f"Poll found audio but no JSON yet: {audio_path}")
+        except Exception as e:
+            print(f"Polling loop error: {e}")
+
+        await asyncio.sleep(15)  # Check every 15 seconds
+
+# ────────────────────────────────────────────────
+# Main entry
+# ────────────────────────────────────────────────
 async def main():
     # Start Discord bot in background
     asyncio.create_task(bot.start(DISCORD_TOKEN))
     
-    # Start file watcher
+    # Start polling watcher
     await run_watcher()
 
 if __name__ == "__main__":
