@@ -181,7 +181,7 @@ async def process_call(audio_path: Path):
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=500),
             initial_prompt=(
-                "Police fire EMS dispatch radio traffic, 10-codes, unit numbers, locations in New Mexico, "
+                "Police fire EMS dispatch radio traffic, 10-codes, unit numbers, locations in the detected area, "
                 "affirmative negative enroute on scene 10-4 10-50 10-20 clear copy responding priority"
             ),
             condition_on_previous_text=True
@@ -257,6 +257,38 @@ async def process_call(audio_path: Path):
 
     # Try batch summary
     await batch_summarize_and_post()
+
+# ────────────────────────────────────────────────
+# Polling watcher loop
+# ────────────────────────────────────────────────
+async def run_watcher():
+    print(f"Starting polling watcher on {WATCH_DIR} (every 15 seconds)")
+    known_paths = set()
+
+    while True:
+        try:
+            for root, dirs, files in os.walk(WATCH_DIR):
+                for filename in files:
+                    if filename.lower().endswith(('.wav', '.mp3', '.m4a')):
+                        audio_path = Path(root) / filename
+                        str_path = str(audio_path)
+
+                        if str_path in known_paths:
+                            continue
+
+                        known_paths.add(str_path)
+
+                        json_path = audio_path.with_suffix('.json')
+
+                        if json_path.exists():
+                            print(f"Poll detected new call: {audio_path} + {json_path}")
+                            await process_call(audio_path)
+                        else:
+                            print(f"Poll found audio but no JSON yet: {audio_path}")
+        except Exception as e:
+            print(f"Polling loop error: {e}")
+
+        await asyncio.sleep(15)
 
 # ────────────────────────────────────────────────
 # Main entry
